@@ -46,19 +46,19 @@ Compile using:
 
 Archive a website:
 
-    ./archive89 https://example.com
+    ./archive89 <url>
 
 Specify an output directory:
 
-    ./archive89 https://example.com --output ./my-archive
+    ./archive89 <url> --output ./my-archive
 
 Create a compressed archive:
 
-    ./archive89 https://example.com --tar.gz
+    ./archive89 <url> --tar.gz
 
 Combine options:
 
-    ./archive89 https://example.com \
+    ./archive89 <url> \
         --output ./backup \
         --tar.gz
 
@@ -146,7 +146,7 @@ The default fetcher uses curl.
 A custom fetcher can be configured:
 
     ARCHIVE89_FETCHER='wget -qO- -U "$ARCHIVE89_AGENT"' \
-        ./archive89 https://example.com
+        ./archive89 https://<url>
 
 The URL is appended as the final argument unless the command contains $1.
 
@@ -219,7 +219,7 @@ Both single-quoted and double-quoted values are supported.
 
 Example:
 
-    <a href="https://example.com/about">About</a>
+    <a href="https://<url>/about">About</a>
     <img src="/images/logo.png">
 
 References are converted to paths relative to the saved HTML file.
@@ -240,12 +240,12 @@ Same-host resources are converted to local equivalents.
 
 Supported URL forms include:
 
-    https://example.com/page
-    http://example.com/page
+    https://<url>/page
+    http://<url>/page
     /page
     ../page
     images/photo.jpg
-    //example.com/page
+    //<url>/page
 
 Query strings are retained when generating request URLs.
 
@@ -257,12 +257,12 @@ URL fragments are preserved in rewritten references.
 
 A typical archive produces:
 
-    example.com/
-    example.com.metadata/
+    <url>/
+    <url>.metadata/
 
 Example website directory:
 
-    example.com/
+    <url>/
     ├── index.html
     ├── about/
     │   └── index.html
@@ -293,9 +293,9 @@ The file .archive89.map records the request plan.
 Example:
 
     # archive89 plan: 3 requests
-    D https://example.com/ example.com/index.html
-    P https://example.com/style.css style.css
-    F https://example.com/image.png image.png
+    D https://<url>/ <url>/index.html
+    P https://<url>/style.css style.css
+    F https://<url>/image.png image.png
 
 State indicators:
 
@@ -317,7 +317,7 @@ Example:
 
     ARCHIVE89_RATE_WAIT=120 \
     ARCHIVE89_RATE_RETRIES=5 \
-    ./archive89 https://example.com
+    ./archive89 https://<url>
 
 This waits 120 seconds between retries and allows up to five retries per URL.
 
@@ -327,13 +327,13 @@ These mechanisms do not guarantee that a website will permit automated crawling.
 
 Use:
 
-    ./archive89 https://example.com --tar.gz
+    ./archive89 https://<url> --tar.gz
 
 This creates:
 
-    example.com/
-    example.com.metadata/
-    example.com.tar.gz
+    <url>/
+    <url>.metadata/
+    <url>.tar.gz
 
 The compressed archive contains the output directory, not the separate metadata directory.
 
@@ -386,14 +386,14 @@ Verify that curl is installed and that the website is accessible.
 Try a custom fetcher:
 
     ARCHIVE89_FETCHER='wget -qO- "$1"' \
-    ./archive89 https://example.com
+    ./archive89 https://<url>
 
 ### HTTP 429 errors
 
 Increase the rate-limit wait:
 
     ARCHIVE89_RATE_WAIT=120 \
-    ./archive89 https://example.com
+    ./archive89 https://<url>
 
 ### Missing resources
 
@@ -405,8 +405,3 @@ These resources may not be discovered.
 
 Check for missing downloads, external-host dependencies, JavaScript-generated URLs, and unsupported HTML or CSS constructs.
 
-## License
-
-No license has been specified yet.
-
-Add a LICENSE file before distributing this project publicly.
