@@ -4,6 +4,10 @@
  *
  * Build: cc -std=c89 -pedantic -Wall -O2 -o archive89 archive89.c
  * No libraries needed: the HTTP fetcher is an external command (see -h).
+ *
+ * Resume: progress is journaled to <metadata dir>/.archive89.map after every
+ * single step. Run the same command again and it continues where it stopped.
+ * Use --fresh to throw the saved progress away.
  */
 #define _POSIX_C_SOURCE 200112L
 
@@ -17,12 +21,26 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #define HSIZE 65536
 #define MAXREF 2000
 #define MAXBODY (200UL * 1024UL * 1024UL)
 #define DEFAULT_AGENT "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+
+#define PANEL 7		/* lines pinned at the top of a terminal */
+#define BARW 30
+
+#define SAVE    "\033" "7"
+#define RESTORE "\033" "8"
+#define C_RESET "\033[0m"
+#define C_BOLD  "\033[1m"
+#define C_DIM   "\033[2m"
+#define C_RED   "\033[31m"
+#define C_GREEN "\033[32m"
+#define C_YELLOW "\033[33m"
+#define C_CYAN  "\033[36m"
 
 /* ---------- helpers ---------- */
 
@@ -406,6 +424,7 @@ struct entry {
 
 struct node {
 	char *key;
+	size_t idx;
 	struct node *next;
 };
 
@@ -416,6 +435,8 @@ static struct node *table[HSIZE];
 static char g_host[256];
 static char g_outdir[2048];
 static char g_metadir[2048];
+static char g_jpath[4400];
+static FILE *g_jf;
 static const char *g_fetcher;
 static char g_default_fetcher[1400];
 static int g_every = 10;
@@ -425,10 +446,16 @@ static double g_rate_wait = 60.0;
 static int g_rate_retries = 10;
 static unsigned long g_max_files;
 static unsigned long g_reqs;
-static unsigned long g_processed;
-static int g_tty;
+static unsigned long g_ok;	/* done (including earlier runs) */
+static unsigned long g_fail;	/* failed in this run */
+static unsigned long g_sess;	/* requests finished in this run */
+static unsigned long g_bytes;	/* downloaded in this run */
+static unsigned long g_resumed;	/* done entries loaded from the journal */
+static time_t g_t0;
+static int g_tty, g_color;
 static const char *g_phase = "";
 static char g_note[64];
+static char g_now[2300];
 
 static unsigned long hash_str(const char *s)
 {
@@ -438,24 +465,26 @@ static unsigned long hash_str(const char *s)
 	return h;
 }
 
-static int seen_find(const char *key)
+/* returns entry index or -1 */
+static long seen_get(const char *key)
 {
 	unsigned long h = hash_str(key) % HSIZE;
 	struct node *n;
 
 	for (n = table[h]; n; n = n->next)
 		if (strcmp(n->key, key) == 0)
-			return 1;
-	return 0;
+			return (long)n->idx;
+	return -1;
 }
 
-static void seen_add(const char *key)
+static void seen_add(const char *key, size_t idx)
 {
 	unsigned long h = hash_str(key) % HSIZE;
 	struct node *n;
 
 	n = (struct node *)xrealloc(NULL, sizeof *n);
 	n->key = xstrdup(key);
+	n->idx = idx;
 	n->next = table[h];
 	table[h] = n;
 }
@@ -517,28 +546,137 @@ static void meta_write(const char *lp, const char *content)
 		fprintf(stderr, "WARN cannot write metadata for %s\n", lp);
 }
 
+/* ---------- journal (resume) ---------- */
+
+/*
+ * .archive89.map, one line per event, flushed immediately:
+ *   P <url> <local path>    planned
+ *   D <local path>          downloaded and saved
+ *   F <local path>          failed (retried on the next run)
+ */
+static void jwrite(char tag, const char *a, const char *b)
+{
+	if (!g_jf)
+		return;
+	if (b)
+		fprintf(g_jf, "%c %s %s\n", tag, a, b);
+	else
+		fprintf(g_jf, "%c %s\n", tag, a);
+	fflush(g_jf);
+}
+
+/* rewrite the journal compactly (atomic via rename) and reopen for append */
+static void write_plan(void)
+{
+	char tmp[4500];
+	FILE *f;
+	size_t i;
+
+	if (g_jf) {
+		fclose(g_jf);
+		g_jf = NULL;
+	}
+	sprintf(tmp, "%s.tmp", g_jpath);
+	f = fopen(tmp, "w");
+	if (f) {
+		fprintf(f, "# archive89 journal: P planned, D done, F failed\n");
+		for (i = 0; i < nent; i++) {
+			fprintf(f, "P %s %s\n", ents[i].url, ents[i].lp);
+			if (ents[i].state == ST_DONE)
+				fprintf(f, "D %s\n", ents[i].lp);
+		}
+		if (fclose(f) == 0)
+			rename(tmp, g_jpath);
+		else
+			remove(tmp);
+	}
+	g_jf = fopen(g_jpath, "a");
+}
+
+static void add_entry(const char *full, const char *lp, int crawl)
+{
+	if (nent == cent) {
+		cent = cent ? cent * 2 : 256;
+		ents = (struct entry *)xrealloc(ents, cent * sizeof *ents);
+	}
+	seen_add(lp, nent);
+	ents[nent].url = xstrdup(full);
+	ents[nent].lp = xstrdup(lp);
+	ents[nent].state = ST_PENDING;
+	ents[nent].crawl = crawl;
+	nent++;
+}
+
+/* replay the journal; returns number of entries loaded */
+static size_t journal_load(void)
+{
+	char line[8192], full[4400];
+	struct stat st;
+	struct url u;
+	FILE *f;
+	char *sp, *p;
+	size_t n, i;
+	long k;
+
+	f = fopen(g_jpath, "r");
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof line, f)) {
+		n = strlen(line);
+		while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+			line[--n] = 0;
+		if (n < 3 || line[1] != ' ')
+			continue;
+		p = line + 2;
+		if (line[0] == 'P') {
+			sp = strchr(p, ' ');
+			if (!sp)
+				continue;
+			*sp = 0;
+			if (!parse_abs(p, &u))
+				continue;
+			if (nent == 0 && strcmp(u.host, g_host) != 0) {
+				fclose(f);
+				die("saved progress belongs to another site (use --fresh)");
+			}
+			if (seen_get(sp + 1) >= 0)
+				continue;
+			add_entry(p, sp + 1, is_crawlable(&u));
+		} else if (line[0] == 'D') {
+			k = seen_get(p);
+			if (k >= 0)
+				ents[k].state = ST_DONE;
+		}
+	}
+	fclose(f);
+	/* a "done" file that is gone from disk must be fetched again */
+	for (i = 0; i < nent; i++) {
+		if (ents[i].state != ST_DONE)
+			continue;
+		sprintf(full, "%s/%s", g_outdir, ents[i].lp);
+		if (stat(full, &st) != 0)
+			ents[i].state = ST_PENDING;
+		else
+			g_ok++;
+	}
+	g_resumed = g_ok;
+	return nent;
+}
+
 /* returns 1 if the file is (now) part of the plan, 0 if over ARCHIVE89_MAX_FILES */
 static int enqueue(const struct url *u)
 {
 	char lp[4400], full[4400];
 
 	local_path(u, lp, sizeof lp);
-	if (seen_find(lp))
+	if (seen_get(lp) >= 0)
 		return 1;
 	if (g_max_files > 0 && (unsigned long)nent >= g_max_files)
 		return 0;
-	seen_add(lp);
 	url_full(u, full);
-	if (nent == cent) {
-		cent = cent ? cent * 2 : 256;
-		ents = (struct entry *)xrealloc(ents, cent * sizeof *ents);
-	}
-	ents[nent].url = xstrdup(full);
-	ents[nent].lp = xstrdup(lp);
-	ents[nent].state = ST_PENDING;
-	ents[nent].crawl = is_crawlable(u);
-	nent++;
+	add_entry(full, lp, is_crawlable(u));
 	meta_write(lp, "");
+	jwrite('P', full, lp);
 	return 1;
 }
 
@@ -761,7 +899,12 @@ static void pause_for(double s)
 		;
 }
 
-/* ---------- progress bar (pinned to the top line on a terminal) ---------- */
+/* ---------- status panel (pinned to the top of a terminal) ---------- */
+
+static const char *col(const char *c)
+{
+	return g_color ? c : "";
+}
 
 static int percent_of(unsigned long n)
 {
@@ -773,26 +916,95 @@ static int percent_of(unsigned long n)
 	return p > 100UL ? 100 : (int)p;
 }
 
+static int term_width(void)
+{
+	struct winsize ws;
+
+	if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20)
+		return (int)ws.ws_col;
+	return 80;
+}
+
+static void fmt_bytes(unsigned long n, char *out)
+{
+	if (n < 1024UL)
+		sprintf(out, "%lu B", n);
+	else if (n < 1024UL * 1024UL)
+		sprintf(out, "%.1f KB", (double)n / 1024.0);
+	else if (n < 1024UL * 1024UL * 1024UL)
+		sprintf(out, "%.1f MB", (double)n / (1024.0 * 1024.0));
+	else
+		sprintf(out, "%.2f GB", (double)n / (1024.0 * 1024.0 * 1024.0));
+}
+
+static void fmt_time(long s, char *out)
+{
+	if (s < 0)
+		s = 0;
+	sprintf(out, "%02ld:%02ld:%02ld", s / 3600L, (s / 60L) % 60L, s % 60L);
+}
+
 static void draw_bar(void)
 {
-	char bar[21];
-	int pct = percent_of(g_processed), fill, k;
+	static const char dashes[] =
+"------------------------------------------------------------"
+"------------------------------------------------------------";
+	char bar[BARW + 1], by[32], el[16], eta[16], now[2300];
+	unsigned long fin = g_ok + g_fail, pend;
+	long el_s;
+	double rate;
+	int pct, fill, k, w, room;
 
 	if (!g_tty)
 		return;
-	fill = pct / 5;
-	for (k = 0; k < 20; k++)
+	w = term_width();
+	pct = percent_of(fin);
+	fill = pct * BARW / 100;
+	for (k = 0; k < BARW; k++)
 		bar[k] = k < fill ? '#' : '-';
-	bar[20] = 0;
-	printf("\033" "7\033[1;1H\033[2K archive89 %3d%% [%s] %lu/%lu  %s  %s\033" "8",
-	       pct, bar, g_processed, (unsigned long)nent, g_phase, g_note);
+	bar[BARW] = 0;
+	pend = (unsigned long)nent > fin ? (unsigned long)nent - fin : 0;
+	el_s = (long)(time(NULL) - g_t0);
+	rate = el_s > 0 ? (double)g_sess / (double)el_s : 0.0;
+	fmt_time(el_s, el);
+	if (rate > 0.0 && pend > 0)
+		fmt_time((long)((double)pend / rate), eta);
+	else
+		strcpy(eta, "--:--:--");
+	fmt_bytes(g_bytes, by);
+	room = w - 8;
+	if (room < 4)
+		room = 4;
+	copy_cap(now, g_now, sizeof now);
+	if ((int)strlen(now) > room)
+		now[room] = 0;
+
+	printf(SAVE);
+	printf("\033[1;1H\033[2K %s%sarchive89%s  %s  %s%s%s",
+	       col(C_BOLD), col(C_CYAN), col(C_RESET), g_host,
+	       col(C_DIM), g_phase, col(C_RESET));
+	printf("\033[2;1H\033[2K  [%s%s%s] %3d%%  %lu / %lu files",
+	       col(C_GREEN), bar, col(C_RESET), pct, fin, (unsigned long)nent);
+	printf("\033[3;1H\033[2K  %sok %lu%s  %sfailed %lu%s  pending %lu"
+	       "  (resumed %lu)",
+	       col(C_GREEN), g_ok, col(C_RESET),
+	       g_fail ? col(C_RED) : "", g_fail, col(C_RESET), pend, g_resumed);
+	printf("\033[4;1H\033[2K  elapsed %s  eta %s  %.1f req/s  data %s",
+	       el, eta, rate, by);
+	printf("\033[5;1H\033[2K  now: %s", now);
+	printf("\033[6;1H\033[2K  %s%s%s", col(C_YELLOW), g_note, col(C_RESET));
+	k = w - 1;
+	if (k > 120)
+		k = 120;
+	printf("\033[7;1H\033[2K%s%.*s%s", col(C_DIM), k, dashes, col(C_RESET));
+	printf(RESTORE);
 	fflush(stdout);
 }
 
 static void tty_reset(void)
 {
 	if (g_tty) {
-		printf("\033[r");
+		printf("\033[r\033[999;1H\n");
 		fflush(stdout);
 	}
 }
@@ -802,24 +1014,29 @@ static void on_signal(int sig)
 	ssize_t r;
 
 	(void)sig;
-	r = write(1, "\033[r\n", 4);
+	r = write(1, "\033[r\033[999;1H\n", 12);
 	(void)r;
 	_exit(130);
 }
 
 static void tty_setup(void)
 {
+	int k;
+
 	g_tty = isatty(1);
 	if (!g_tty)
 		return;
-	printf("\n\033[2;r\033[2;1H");
+	g_color = getenv("NO_COLOR") == NULL;
+	for (k = 0; k < PANEL; k++)
+		printf("\n");
+	printf("\033[%d;r\033[%d;1H", PANEL + 1, PANEL + 1);
 	fflush(stdout);
 	atexit(tty_reset);
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 }
 
-/* sleep with a visible countdown in the bar */
+/* sleep with a visible countdown in the panel */
 static void wait_secs(double s, const char *label)
 {
 	double step;
@@ -835,28 +1052,14 @@ static void wait_secs(double s, const char *label)
 	draw_bar();
 }
 
-/* the "map": every planned request, one per line, rewritten as state changes */
-static void write_plan(void)
-{
-	char path[4400];
-	static const char st[] = "PDF";
-	FILE *f;
-	size_t i;
-
-	if (strlen(g_metadir) + 20 > sizeof path)
-		return;
-	sprintf(path, "%s/.archive89.map", g_metadir);
-	f = fopen(path, "w");
-	if (!f)
-		return;
-	fprintf(f, "# archive89 plan: %lu requests (P pending, D done, F failed)\n",
-		(unsigned long)nent);
-	for (i = 0; i < nent; i++)
-		fprintf(f, "%c %s %s\n", st[ents[i].state], ents[i].url, ents[i].lp);
-	fclose(f);
-}
-
 /* ---------- crawl ---------- */
+
+static void mark_fail(size_t idx)
+{
+	ents[idx].state = ST_FAILED;
+	g_fail++;
+	jwrite('F', ents[idx].lp, NULL);
+}
 
 static void process_one(size_t idx)
 {
@@ -868,9 +1071,9 @@ static void process_one(size_t idx)
 	int html, rc, tries = 0;
 
 	if (g_every > 0 && g_reqs > 0 && g_reqs % (unsigned long)g_every == 0) {
-		printf("PAUSE %.1fs (after %lu requests)\n", g_timeout, g_reqs);
+		printf("%sPAUSE%s %.1fs (after %lu requests)\n",
+		       col(C_CYAN), col(C_RESET), g_timeout, g_reqs);
 		fflush(stdout);
-		write_plan();
 		wait_secs(g_timeout, "pause");
 	}
 	g_reqs++;
@@ -878,7 +1081,7 @@ static void process_one(size_t idx)
 	memset(&body, 0, sizeof body);
 	memset(&out, 0, sizeof out);
 	if (!parse_abs(url, &u)) {
-		ents[idx].state = ST_FAILED;
+		mark_fail(idx);
 		return;
 	}
 	for (;;) {
@@ -888,20 +1091,21 @@ static void process_one(size_t idx)
 		free(body.p);
 		memset(&body, 0, sizeof body);
 		if (++tries > g_rate_retries) {
-			fprintf(stderr, "[%3d%%] FAIL %s (still rate limited, gave up)\n",
-				percent_of(g_processed + 1), url);
-			ents[idx].state = ST_FAILED;
+			fprintf(stderr, "[%3d%%] %sFAIL%s %s (still rate limited, gave up)\n",
+				percent_of(g_ok + g_fail + 1), col(C_RED), col(C_RESET), url);
+			mark_fail(idx);
 			return;
 		}
-		printf("RATE too many requests; waiting %.0fs, retry %d/%d: %s\n",
-		       g_rate_wait, tries, g_rate_retries, url);
+		printf("%sRATE%s too many requests; waiting %.0fs, retry %d/%d: %s\n",
+		       col(C_YELLOW), col(C_RESET), g_rate_wait, tries,
+		       g_rate_retries, url);
 		fflush(stdout);
-		write_plan();
 		wait_secs(g_rate_wait, "rate limited, retry in");
 	}
 	if (rc != FETCH_OK) {
-		fprintf(stderr, "[%3d%%] FAIL %s\n", percent_of(g_processed + 1), url);
-		ents[idx].state = ST_FAILED;
+		fprintf(stderr, "[%3d%%] %sFAIL%s %s\n", percent_of(g_ok + g_fail + 1),
+			col(C_RED), col(C_RESET), url);
+		mark_fail(idx);
 		free(body.p);
 		return;
 	}
@@ -922,12 +1126,17 @@ static void process_one(size_t idx)
 
 	if (save_file(g_outdir, lp, out.p, out.len) == 0) {
 		ents[idx].state = ST_DONE;
+		g_ok++;
+		g_bytes += (unsigned long)body.len;
 		sprintf(loc, "%s/%s", g_outdir, lp);
 		meta_write(lp, loc);
-		printf("[%3d%%] OK   %s -> %s\n", percent_of(g_processed + 1), url, lp);
+		jwrite('D', lp, NULL);
+		printf("[%3d%%] %sOK%s   %s -> %s\n", percent_of(g_ok + g_fail),
+		       col(C_GREEN), col(C_RESET), url, lp);
 	} else {
-		fprintf(stderr, "[%3d%%] FAIL cannot write %s\n", percent_of(g_processed + 1), lp);
-		ents[idx].state = ST_FAILED;
+		fprintf(stderr, "[%3d%%] %sFAIL%s cannot write %s\n",
+			percent_of(g_ok + g_fail + 1), col(C_RED), col(C_RESET), lp);
+		mark_fail(idx);
 	}
 	free(body.p);
 	free(out.p);
@@ -935,9 +1144,10 @@ static void process_one(size_t idx)
 
 static void process(size_t idx)
 {
+	copy_cap(g_now, ents[idx].url, sizeof g_now);
 	draw_bar();
 	process_one(idx);
-	g_processed++;
+	g_sess++;
 	draw_bar();
 }
 
@@ -951,11 +1161,15 @@ static void usage(FILE *f)
 "\n"
 "Crawls a website (same host only) and saves it for offline viewing.\n"
 "Default output directory: ~/<domain_name>\n"
+"Interrupted runs resume automatically when started again with the same\n"
+"url and output directory.\n"
 "\n"
 "options:\n"
 "  --url <url>         site to archive\n"
 "  --output <dir>      save into <dir> instead of ~/<domain_name>\n"
-"  --tar.gz, --tar     also create <dir>.tar.gz\n"
+"  --fresh             ignore saved progress and start over\n"
+"  --tar.gz, --tar     also create <dir>.tar.gz\n", f);
+	fputs(
 "  -h, --help          show this help\n", f);
 	fputs(
 "\n"
@@ -987,12 +1201,15 @@ static void usage(FILE *f)
 "  ARCHIVE89_TAR          1 = same as --tar.gz\n"
 "  ARCHIVE89_METADATA     metadata directory (default <output dir>.metadata)\n", f);
 	fputs(
+"  NO_COLOR               set to disable colors\n", f);
+	fputs(
 "\n"
 "Phase 1 crawls the site and maps every planned request (metadata tree +\n"
-".archive89.map). After ARCHIVE89_WAIT, phase 2 downloads what is missing.\n"
-"In the metadata tree an empty file = not downloaded, otherwise it holds\n"
-"the path of the saved copy. On a terminal a progress percentage stays\n"
-"pinned to the top line.\n", f);
+".archive89.map, a journal updated after every step). After ARCHIVE89_WAIT,\n"
+"phase 2 downloads what is missing. In the metadata tree an empty file =\n"
+"not downloaded, otherwise it holds the path of the saved copy. On a\n"
+"terminal a status panel (progress, counts, speed, ETA) stays pinned to the\n"
+"top. Failed files are retried on the next run.\n", f);
 }
 
 static void env_default(const char *name, const char *value)
@@ -1098,8 +1315,8 @@ int main(int argc, char **argv)
 	const char *urlarg = NULL, *outarg = NULL, *e;
 	char starturl[2300], hostdir[300];
 	struct url start;
-	size_t i, done = 0, pending = 0;
-	int a, tar = 0;
+	size_t i, pending = 0, loaded;
+	int a, tar = 0, fresh = 0;
 
 	for (a = 1; a < argc; a++) {
 		const char *arg = argv[a];
@@ -1120,6 +1337,8 @@ int main(int argc, char **argv)
 			outarg = argv[a];
 		} else if (!strcmp(arg, "--tar.gz") || !strcmp(arg, "--tar")) {
 			tar = 1;
+		} else if (!strcmp(arg, "--fresh")) {
+			fresh = 1;
 		} else if (arg[0] == '-') {
 			fprintf(stderr, "archive89: unknown option %s\n", arg);
 			usage(stderr);
@@ -1207,6 +1426,19 @@ int main(int argc, char **argv)
 		die("cannot create metadata directory");
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
+
+	/* resume: replay the journal unless --fresh */
+	sprintf(g_jpath, "%s/.archive89.map", g_metadir);
+	if (fresh)
+		remove(g_jpath);
+	loaded = journal_load();
+	write_plan();
+	if (loaded > 0)
+		printf("resuming: %lu planned, %lu already downloaded, %lu to do\n",
+		       (unsigned long)loaded, g_resumed,
+		       (unsigned long)loaded - g_resumed);
+
+	g_t0 = time(NULL);
 	tty_setup();
 	enqueue(&start);
 
@@ -1220,8 +1452,8 @@ int main(int argc, char **argv)
 		if (ents[i].state == ST_PENDING)
 			pending++;
 	write_plan();
-	printf("map: %lu planned requests, %lu still to download (%s/.archive89.map)\n",
-	       (unsigned long)nent, (unsigned long)pending, g_metadir);
+	printf("map: %lu planned requests, %lu still to download (%s)\n",
+	       (unsigned long)nent, (unsigned long)pending, g_jpath);
 
 	g_phase = "phase 2/2: download";
 	wait_secs(g_wait, "starting in");
@@ -1230,12 +1462,12 @@ int main(int argc, char **argv)
 		if (ents[i].state == ST_PENDING)
 			process(i);
 	write_plan();
+	g_phase = "finished";
+	g_now[0] = 0;
+	draw_bar();
 
-	for (i = 0; i < nent; i++)
-		if (ents[i].state == ST_DONE)
-			done++;
-	printf("done: %lu of %lu files downloaded -> %s\n",
-	       (unsigned long)done, (unsigned long)nent, g_outdir);
+	printf("done: %lu of %lu files downloaded (%lu failed, rerun to retry) -> %s\n",
+	       g_ok, (unsigned long)nent, g_fail, g_outdir);
 	printf("metadata: %s\n", g_metadir);
 
 	if (tar && make_targz(g_outdir) != 0) {
